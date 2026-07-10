@@ -12,6 +12,8 @@
 - 使用 8 邻域 Dijkstra 预计算考虑障碍物的启发代价，避免欧氏距离启发在死胡同中盲目扩展。
 - 基于自行车模型生成运动基元，并对整段运动进行采样碰撞检测，避免大步长“跨墙”。
 - 支持机器人半径膨胀、未知区域安全策略、方向切换惩罚和搜索上限。
+- 通过 TF 将 `/odom`、`/initialpose` 和 `/goal_pose` 统一转换到地图坐标系，避免跨 frame 直接混用。
+- 控制器可根据路径航向自动识别前进/倒车段，并发布正向或负向 `cmd_vel`。
 - 完成 ROS 2 地图、里程计、目标位姿、路径与速度指令的端到端集成。
 - 所有关键规划/控制参数均可通过 ROS 参数 YAML 调整，启动文件不依赖开发者本机路径。
 - 核心算法与 ROS 解耦，提供快速单元测试验证启发函数、碰撞检测和绕障能力。
@@ -21,11 +23,13 @@
 ```mermaid
 flowchart LR
     Map["/map<br/>OccupancyGrid"] --> Inflate["阈值化 + 障碍膨胀"]
-    Odom["/odom"] --> Planner["Hybrid A*"]
+    TF["TF: map -> odom"] --> Planner["Hybrid A*"]
+    Odom["/odom"] --> Planner
     Goal["/goal_pose"] --> Planner
     Inflate --> Planner
     Planner --> Path["/planned_path<br/>Path"]
-    Path --> Controller["Pure Pursuit"]
+    Path --> Controller["Reverse-aware Pure Pursuit"]
+    TF --> Controller
     Odom --> Controller
     Controller --> Cmd["/cmd_vel<br/>Twist"]
 ```
@@ -37,7 +41,7 @@ flowchart LR
 3. 从目标点执行 8 邻域 Dijkstra，得到包含障碍绕行代价的二维启发图。
 4. 使用自行车运动学模型扩展 `(x, y, yaw, direction)` 状态，并离散航向用于去重。
 5. 对运动基元全程采样碰撞检测，同时加入倒车、换向与转向惩罚。
-6. 将轨迹恢复为带航向四元数的 `nav_msgs/Path`，交给 Pure Pursuit 控制器跟踪。
+6. 将轨迹恢复为带航向四元数的 `nav_msgs/Path`，控制器据此推断前进/倒车段并跟踪。
 
 ## 环境要求
 
@@ -83,8 +87,9 @@ python3 -m pytest -q src/hybrid_algorithm_pkg/test/test_hybrid_astar.py
 ros2 launch hybrid_algorithm_pkg planner.launch.py
 ```
 
-在 RViz2 中使用 **2D Goal Pose** 发布目标。默认从 `/odom` 获取起点；若希望使用
-RViz 的 **2D Pose Estimate**，将 `use_odom_start` 设为 `false`。
+在 RViz2 中使用 **2D Goal Pose** 发布目标。默认从 `/odom` 获取起点，并通过 TF 转换到地图 frame；若希望使用
+RViz 的 **2D Pose Estimate**，将 `use_odom_start` 设为 `false`。运行时需要存在
+`map -> odom` 的 TF，通常由 SLAM、AMCL 或仿真定位节点发布。
 
 只运行规划器、不启动控制器或 RViz：
 
@@ -123,6 +128,7 @@ ros2 launch hybrid_algorithm_pkg gazebo_sim.launch.py \
 
 | 参数 | 默认值 | 含义 |
 | --- | ---: | --- |
+| `map_frame` | `map` | 规划与控制统一使用的地图坐标系 |
 | `robot_radius` | 0.25 m | 地图障碍膨胀半径 |
 | `motion_step` | 0.20 m | 单个运动基元长度 |
 | `wheelbase` | 0.40 m | 自行车模型等效轴距 |
@@ -130,7 +136,7 @@ ros2 launch hybrid_algorithm_pkg gazebo_sim.launch.py \
 | `heading_bins` | 72 | 航向离散数量 |
 | `max_iterations` | 250000 | 单次搜索扩展上限 |
 | `lookahead_distance` | 0.40 m | Pure Pursuit 预瞄距离 |
-| `target_speed` | 0.20 m/s | 跟踪目标速度 |
+| `target_speed` | 0.20 m/s | 跟踪目标速度，倒车段自动取负 |
 
 完整配置见 `config/planner_params.yaml`。
 
@@ -154,7 +160,7 @@ hybrid_algorithm_pkg/
 - 当前碰撞模型以膨胀后的质点栅格近似机器人轮廓，尚未实现随航向变化的多边形 footprint。
 - Gazebo 启动示例依赖外部机器人描述、世界和地图资源，仓库不重复分发这些资产。
 - 当前规划在目标回调中同步执行；超大地图可进一步改为工作线程或 ROS 2 Action Server。
-- `map -> odom` 的定位关系应由真实定位系统提供；示例仿真仅使用单位静态变换。
+- `map -> odom` 的定位关系应由真实定位系统提供；示例仿真仅使用单位静态变换，实际机器人建议接 AMCL、Cartographer 或其他定位节点。
 
 ## License
 

@@ -1,5 +1,6 @@
 hybrid_algorithm_planner:
   ros__parameters:
+    map_frame: map
     use_odom_start: true
     robot_radius: 0.25
     occupied_threshold: 50
@@ -13,6 +14,7 @@ hybrid_algorithm_planner:
 
 pure_pursuit_controller:
   ros__parameters:
+    map_frame: map
     lookahead_distance: 0.40
     target_speed: 0.20
     goal_tolerance: 0.25

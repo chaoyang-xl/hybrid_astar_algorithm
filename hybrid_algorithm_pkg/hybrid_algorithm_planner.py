@@ -4,13 +4,15 @@
 import math
 import time
 
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from geometry_msgs.msg import Pose, PoseStamped, PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
 import numpy as np
 import rclpy
+from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from scipy import ndimage
+from tf2_ros import Buffer, TransformException, TransformListener
 
 from .hybrid_astar import (
     extract_trajectory, hybrid_astar, Node as SearchNode, SearchConfig)
@@ -27,11 +29,13 @@ class HybridAlgorithmPlanner(Node):
         self.map_resolution = None
         self.map_origin_x = None
         self.map_origin_y = None
+        self.map_frame = "map"
 
         self.declare_parameter("map_topic", "/map")
         self.declare_parameter("odom_topic", "/odom")
         self.declare_parameter("goal_topic", "/goal_pose")
         self.declare_parameter("path_topic", "/planned_path")
+        self.declare_parameter("map_frame", "map")
         self.declare_parameter("use_odom_start", True)
         self.declare_parameter("robot_radius", 0.25)
         self.declare_parameter("occupied_threshold", 50)
@@ -42,6 +46,9 @@ class HybridAlgorithmPlanner(Node):
         self.declare_parameter("max_steering_angle_deg", 30.0)
         self.declare_parameter("heading_bins", 72)
         self.declare_parameter("max_iterations", 250000)
+
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         map_qos = QoSProfile(
             depth=1,
@@ -107,6 +114,9 @@ class HybridAlgorithmPlanner(Node):
         self.map_resolution = msg.info.resolution
         self.map_origin_x = msg.info.origin.position.x
         self.map_origin_y = msg.info.origin.position.y
+        self.map_frame = (
+            msg.header.frame_id or str(self.get_parameter("map_frame").value)
+        )
         self.get_logger().info(
             f"Map ready: {msg.info.width}x{msg.info.height}, "
             f"resolution={msg.info.resolution:.3f} m, "
@@ -117,21 +127,79 @@ class HybridAlgorithmPlanner(Node):
         """Use RViz's initial pose when odometry-based starts are disabled."""
         if bool(self.get_parameter("use_odom_start").value):
             return
-        self.start = self._pose_to_node(msg.pose.pose)
+        pose = self._pose_to_map(
+            msg.pose.pose, msg.header.frame_id, msg.header.stamp, self.map_frame
+        )
+        self.start = self._pose_to_node(pose) if pose is not None else None
 
     def odom_callback(self, msg: Odometry) -> None:
         """Continuously update the planning start from odometry."""
         if not bool(self.get_parameter("use_odom_start").value):
             return
-        self.start = self._pose_to_node(msg.pose.pose)
+        pose = self._pose_to_map(
+            msg.pose.pose,
+            msg.header.frame_id,
+            msg.header.stamp,
+            str(self.get_parameter("odom_topic").value).lstrip("/"),
+        )
+        self.start = self._pose_to_node(pose) if pose is not None else None
 
     def goal_callback(self, msg: PoseStamped) -> None:
         """Store a goal and start planning."""
-        self.goal = self._pose_to_node(msg.pose)
+        pose = self._pose_to_map(
+            msg.pose, msg.header.frame_id, msg.header.stamp, self.map_frame
+        )
+        self.goal = self._pose_to_node(pose) if pose is not None else None
         if self.goal is None:
             self.get_logger().warn("Goal ignored because no map has been received.")
             return
         self.plan()
+
+    def _pose_to_map(
+        self, pose: Pose, frame_id: str, stamp, default_frame: str
+    ):
+        if self.map_resolution is None:
+            return None
+
+        source_frame = frame_id or default_frame
+        target_frame = self.map_frame or str(self.get_parameter("map_frame").value)
+        if source_frame == target_frame:
+            return pose
+
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                target_frame, source_frame, stamp, timeout=Duration(seconds=0.1)
+            )
+        except TransformException as exc:
+            self.get_logger().warn(
+                f"Cannot transform pose from {source_frame} to {target_frame}: {exc}"
+            )
+            return None
+        return self._transform_pose(pose, transform.transform)
+
+    @staticmethod
+    def _transform_pose(pose: Pose, transform) -> Pose:
+        rotation_yaw = HybridAlgorithmPlanner._get_yaw(transform.rotation)
+        cos_yaw = math.cos(rotation_yaw)
+        sin_yaw = math.sin(rotation_yaw)
+
+        result = Pose()
+        result.position.x = (
+            cos_yaw * pose.position.x
+            - sin_yaw * pose.position.y
+            + transform.translation.x
+        )
+        result.position.y = (
+            sin_yaw * pose.position.x
+            + cos_yaw * pose.position.y
+            + transform.translation.y
+        )
+        result.position.z = pose.position.z + transform.translation.z
+
+        yaw = HybridAlgorithmPlanner._get_yaw(pose.orientation) + rotation_yaw
+        result.orientation.z = math.sin(yaw / 2.0)
+        result.orientation.w = math.cos(yaw / 2.0)
+        return result
 
     def _pose_to_node(self, pose):
         if self.map_resolution is None:
@@ -179,7 +247,7 @@ class HybridAlgorithmPlanner(Node):
         trajectory = extract_trajectory(result)
         path_msg = Path()
         path_msg.header.stamp = self.get_clock().now().to_msg()
-        path_msg.header.frame_id = "map"
+        path_msg.header.frame_id = self.map_frame
         for x, y, yaw in trajectory:
             pose = PoseStamped()
             pose.header = path_msg.header
