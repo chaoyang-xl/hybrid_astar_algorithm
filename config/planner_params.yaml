@@ -1,0 +1,20 @@
+hybrid_algorithm_planner:
+  ros__parameters:
+    use_odom_start: true
+    robot_radius: 0.25
+    occupied_threshold: 50
+    unknown_is_occupied: true
+    motion_step: 0.20
+    wheelbase: 0.40
+    goal_tolerance: 0.10
+    max_steering_angle_deg: 30.0
+    heading_bins: 72
+    max_iterations: 250000
+
+pure_pursuit_controller:
+  ros__parameters:
+    lookahead_distance: 0.40
+    target_speed: 0.20
+    goal_tolerance: 0.25
+    max_angular_speed: 1.0
+    control_frequency: 20.0
