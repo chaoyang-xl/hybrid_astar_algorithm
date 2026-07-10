@@ -36,7 +36,9 @@ class HybridAlgorithmPlanner(Node):
         self.declare_parameter("goal_topic", "/goal_pose")
         self.declare_parameter("path_topic", "/planned_path")
         self.declare_parameter("map_frame", "map")
+        self.declare_parameter("start_pose_source", "odom")
         self.declare_parameter("use_odom_start", True)
+        self.declare_parameter("amcl_pose_topic", "/amcl_pose")
         self.declare_parameter("robot_radius", 0.25)
         self.declare_parameter("occupied_threshold", 50)
         self.declare_parameter("unknown_is_occupied", True)
@@ -82,6 +84,12 @@ class HybridAlgorithmPlanner(Node):
         self.path_publisher = self.create_publisher(
             Path, self.get_parameter("path_topic").value, 10
         )
+        self.create_subscription(
+            PoseWithCovarianceStamped,
+            self.get_parameter("amcl_pose_topic").value,
+            self.amcl_callback,
+            10,
+        )
         self.get_logger().info("Hybrid A* planner is ready; waiting for map and pose.")
 
     def map_callback(self, msg: OccupancyGrid) -> None:
@@ -123,9 +131,18 @@ class HybridAlgorithmPlanner(Node):
             f"inflation={inflation_cells} cells."
         )
 
+    def amcl_callback(self, msg: PoseWithCovarianceStamped) -> None:
+        """Use AMCL's map-frame pose when configured as the start source."""
+        if self._start_pose_source() != "amcl":
+            return
+        pose = self._pose_to_map(
+            msg.pose.pose, msg.header.frame_id, msg.header.stamp, self.map_frame
+        )
+        self.start = self._pose_to_node(pose) if pose is not None else None
+
     def start_callback(self, msg: PoseWithCovarianceStamped) -> None:
-        """Use RViz's initial pose when odometry-based starts are disabled."""
-        if bool(self.get_parameter("use_odom_start").value):
+        """Use RViz's initial pose when configured as the start source."""
+        if self._start_pose_source() != "initialpose":
             return
         pose = self._pose_to_map(
             msg.pose.pose, msg.header.frame_id, msg.header.stamp, self.map_frame
@@ -134,7 +151,7 @@ class HybridAlgorithmPlanner(Node):
 
     def odom_callback(self, msg: Odometry) -> None:
         """Continuously update the planning start from odometry."""
-        if not bool(self.get_parameter("use_odom_start").value):
+        if self._start_pose_source() != "odom":
             return
         pose = self._pose_to_map(
             msg.pose.pose,
@@ -143,6 +160,14 @@ class HybridAlgorithmPlanner(Node):
             str(self.get_parameter("odom_topic").value).lstrip("/"),
         )
         self.start = self._pose_to_node(pose) if pose is not None else None
+
+    def _start_pose_source(self) -> str:
+        source = str(self.get_parameter("start_pose_source").value).lower()
+        if source in {"odom", "amcl", "initialpose"}:
+            return source
+        if bool(self.get_parameter("use_odom_start").value):
+            return "odom"
+        return "initialpose"
 
     def goal_callback(self, msg: PoseStamped) -> None:
         """Store a goal and start planning."""
@@ -273,9 +298,12 @@ def main(args=None) -> None:
     node = HybridAlgorithmPlanner()
     try:
         rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            node.destroy_node()
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
